@@ -9,7 +9,7 @@ import settingsReducer from './slices/settingsSlice';
 const persistConfig = {
   key: 'transcribe-app',
   storage,
-  whitelist: ['fileProcessing', 'settings'], // Only persist these reducers
+  whitelist: ['settings'], // Only persist settings, not fileProcessing due to File objects
 };
 
 const rootReducer = combineReducers({
@@ -24,8 +24,20 @@ export const store = configureStore({
   middleware: (getDefaultMiddleware) =>
     getDefaultMiddleware({
       serializableCheck: {
-        ignoredActions: ['persist/PERSIST', 'persist/REHYDRATE'],
-        ignoredPaths: ['register'],
+        ignoredActions: [
+          'persist/PERSIST', 
+          'persist/REHYDRATE',
+          'fileProcessing/addFiles',
+          'fileProcessing/generateSpeech/fulfilled',
+          'fileProcessing/generateSpeech/pending',
+          'fileProcessing/generateSpeech/rejected'
+        ],
+        ignoredPaths: [
+          'register',
+          'fileProcessing.files',
+          'fileProcessing.files.finalAudio.blob',
+          '_persist'
+        ]
       },
     }),
 });

@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
 import {
   transcribeFile,
@@ -6,6 +6,9 @@ import {
   generateSpeech,
   setCurrentlyProcessing,
   markFileFailed,
+  approveFile,
+  addToReviewQueue,
+  removeFromQueue,
   FILE_STATUS
 } from '../store/slices/fileProcessingSlice';
 
@@ -15,7 +18,9 @@ export const useFileProcessor = () => {
     files, 
     processingQueue, 
     currentlyProcessing,
-    globalSettings 
+    globalSettings,
+    reviewQueue,
+    approvedFiles 
   } = useSelector(state => state.fileProcessing);
   
   const { 
@@ -24,95 +29,151 @@ export const useFileProcessor = () => {
     processingSettings 
   } = useSelector(state => state.settings);
 
+  // Use refs to store current values without causing re-renders
+  const filesRef = useRef(files);
+  const settingsRef = useRef({ aiSettings, voiceSettings, globalSettings });
+  const processingRef = useRef(false);
+  
+  // Update refs when values change
+  useEffect(() => {
+    filesRef.current = files;
+  }, [files]);
+  
+  useEffect(() => {
+    settingsRef.current = { aiSettings, voiceSettings, globalSettings };
+  }, [aiSettings, voiceSettings, globalSettings]);
+
+  // Stable processing function that doesn't depend on changing state
   const processNextInQueue = useCallback(async () => {
-    // Don't start if already processing or queue is empty
-    if (currentlyProcessing || processingQueue.length === 0) {
+    // Prevent concurrent processing
+    if (processingRef.current) {
       return;
     }
-
-    const nextFileId = processingQueue[0];
-    const file = files.find(f => f.id === nextFileId);
     
-    if (!file) {
-      return;
-    }
-
-    dispatch(setCurrentlyProcessing(nextFileId));
-
+    processingRef.current = true;
+    
     try {
-      // Step 1: Transcription
-      if (file.status === FILE_STATUS.PENDING) {
-        const transcriptionResult = await dispatch(transcribeFile({
-          fileId: nextFileId,
-          file: file.originalFile
-        })).unwrap();
-        
-        // Wait a bit before next step
-        await new Promise(resolve => setTimeout(resolve, 1000));
+      // Get current state from store directly
+      const state = dispatch((_, getState) => getState());
+      const currentFiles = state.fileProcessing.files;
+      const currentQueue = state.fileProcessing.processingQueue;
+      const currentlyProcessingFile = state.fileProcessing.currentlyProcessing;
+      const currentSettings = state.settings;
+      const currentGlobalSettings = state.fileProcessing.globalSettings;
+      
+      // Don't start if already processing or queue is empty
+      if (currentlyProcessingFile || currentQueue.length === 0) {
+        return;
       }
 
-      // Step 2: AI Processing
-      if (file.status === FILE_STATUS.TRANSCRIBED) {
-        const apiKey = aiSettings.openaiApiKey || import.meta.env.VITE_OPENAI_API_KEY;
-        
-        if (!apiKey) {
-          throw new Error('No OpenAI API key available');
+      const nextFileId = currentQueue[0];
+      const file = currentFiles.find(f => f.id === nextFileId);
+      
+      if (!file) {
+        // Remove invalid file from queue
+        dispatch(removeFromQueue(nextFileId));
+        return;
+      }
+
+      // Skip files that are waiting for review
+      if (currentGlobalSettings.batchReviewMode && file.status === FILE_STATUS.REVIEW_PENDING) {
+        dispatch(removeFromQueue(nextFileId));
+        return;
+      }
+
+      dispatch(setCurrentlyProcessing(nextFileId));
+
+      try {
+        // Step 1: Transcription
+        if (file.status === FILE_STATUS.PENDING) {
+          await dispatch(transcribeFile({
+            fileId: nextFileId,
+            file: file.originalFile
+          })).unwrap();
+          
+          // Wait a bit before next step
+          await new Promise(resolve => setTimeout(resolve, 1000));
         }
 
-        await dispatch(processWithAI({
-          fileId: nextFileId,
-          text: file.editableTranscription || file.transcription.text,
-          prompt: aiSettings.customPrompt || aiSettings.prompts[aiSettings.selectedPromptType],
-          apiKey: apiKey
-        })).unwrap();
+        // Step 2: AI Processing - get fresh file state
+        const freshState = dispatch((_, getState) => getState());
+        const freshFile = freshState.fileProcessing.files.find(f => f.id === nextFileId);
         
-        // Wait a bit before next step
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
+        if (freshFile && freshFile.status === FILE_STATUS.TRANSCRIBED) {
+          const apiKey = currentSettings.aiSettings.openaiApiKey || import.meta.env.VITE_OPENAI_API_KEY;
+          
+          if (!apiKey) {
+            throw new Error('No OpenAI API key available');
+          }
 
-      // Step 3: Speech Generation
-      if (file.status === FILE_STATUS.AI_PROCESSED) {
-        await dispatch(generateSpeech({
+          await dispatch(processWithAI({
+            fileId: nextFileId,
+            text: freshFile.editableTranscription || freshFile.transcription.text,
+            prompt: currentSettings.aiSettings.customPrompt || currentSettings.aiSettings.prompts?.[currentSettings.aiSettings.selectedPromptType],
+            apiKey: apiKey
+          })).unwrap();
+          
+          // Wait a bit before next step
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+
+        // Step 3: Get final fresh state for audio generation check
+        const finalState = dispatch((_, getState) => getState());
+        const finalFile = finalState.fileProcessing.files.find(f => f.id === nextFileId);
+        const finalGlobalSettings = finalState.fileProcessing.globalSettings;
+        
+        // Check if review mode is enabled and file is pending review
+        if (finalGlobalSettings.batchReviewMode && finalFile.status === FILE_STATUS.REVIEW_PENDING) {
+          // File is waiting for review - stop processing this file
+          dispatch(setCurrentlyProcessing(null));
+          dispatch(removeFromQueue(nextFileId));
+          return;
+        }
+
+        // Step 4: Speech Generation (only for approved files or when review mode is off)
+        if (finalFile.status === FILE_STATUS.APPROVED || 
+            (!finalGlobalSettings.batchReviewMode && finalFile.status === FILE_STATUS.AI_PROCESSED)) {
+          await dispatch(generateSpeech({
+            fileId: nextFileId,
+            text: finalFile.editableAIResult || finalFile.aiResult.processed_text,
+            voiceSettings: currentSettings.voiceSettings
+          })).unwrap();
+        }
+
+      } catch (error) {
+        console.error(`Processing failed for file ${file.name}:`, error);
+        dispatch(markFileFailed({
           fileId: nextFileId,
-          text: file.editableAIResult || file.aiResult.processed_text,
-          voiceSettings: voiceSettings
-        })).unwrap();
+          error: error.message || 'Unknown error occurred'
+        }));
+      } finally {
+        // Always clean up
+        dispatch(removeFromQueue(nextFileId));
+        dispatch(setCurrentlyProcessing(null));
       }
-
-    } catch (error) {
-      console.error(`Processing failed for file ${file.name}:`, error);
-      dispatch(markFileFailed({
-        fileId: nextFileId,
-        error: error.message || 'Unknown error occurred'
-      }));
     } finally {
-      dispatch(setCurrentlyProcessing(null));
-      
-      // Continue with next file after a short delay
-      setTimeout(() => {
-        processNextInQueue();
-      }, 2000);
+      processingRef.current = false;
     }
-  }, [
-    currentlyProcessing, 
-    processingQueue, 
-    files, 
-    dispatch, 
-    aiSettings, 
-    voiceSettings
-  ]);
+  }, [dispatch]); // Only depend on dispatch
 
-  // Auto-start processing when files are added to queue
+  // Simple effect to trigger processing - only depends on basic queue state
   useEffect(() => {
-    if (!currentlyProcessing && processingQueue.length > 0) {
-      processNextInQueue();
+    if (!currentlyProcessing && processingQueue.length > 0 && !processingRef.current) {
+      // Use a short timeout to avoid rapid fire calls
+      const timeoutId = setTimeout(processNextInQueue, 500);
+      return () => clearTimeout(timeoutId);
     }
-  }, [processNextInQueue, currentlyProcessing, processingQueue.length]);
+  }, [currentlyProcessing, processingQueue.length, processNextInQueue]);
 
   const startBatchProcessing = useCallback((fileIds) => {
     const validFileIds = fileIds.filter(id => {
       const file = files.find(f => f.id === id);
-      return file && file.status === FILE_STATUS.PENDING;
+      return file && (
+        file.status === FILE_STATUS.PENDING ||
+        file.status === FILE_STATUS.TRANSCRIBED ||
+        file.status === FILE_STATUS.AI_PROCESSED ||
+        file.status === FILE_STATUS.APPROVED
+      );
     });
 
     if (validFileIds.length === 0) {
@@ -163,6 +224,59 @@ export const useFileProcessor = () => {
     return failedFiles.length;
   }, [files, dispatch]);
 
+  const reprocessFile = useCallback(async (fileId) => {
+    const file = files.find(f => f.id === fileId);
+    if (!file) {
+      throw new Error('File not found');
+    }
+
+    const apiKey = aiSettings.openaiApiKey || import.meta.env.VITE_OPENAI_API_KEY;
+    if (!apiKey) {
+      throw new Error('No OpenAI API key available');
+    }
+
+    try {
+      const result = await dispatch(processWithAI({
+        fileId,
+        text: file.editableTranscription || file.transcription?.text,
+        prompt: globalSettings.customPrompt || globalSettings.aiPrompt,
+        apiKey
+      })).unwrap();
+      
+      return result;
+    } catch (error) {
+      console.error(`Reprocessing failed for file ${file.name}:`, error);
+      throw error;
+    }
+  }, [files, dispatch, aiSettings.openaiApiKey, globalSettings.customPrompt, globalSettings.aiPrompt]);
+
+  const startBatchAudioGeneration = useCallback(async () => {
+    const filesToProcess = approvedFiles
+      .map(id => files.find(f => f.id === id))
+      .filter(file => file && file.status === FILE_STATUS.APPROVED);
+
+    if (filesToProcess.length === 0) {
+      throw new Error('No approved files to generate audio for');
+    }
+
+    for (const file of filesToProcess) {
+      try {
+        await dispatch(generateSpeech({
+          fileId: file.id,
+          text: file.editableAIResult || file.aiResult?.processed_text,
+          voiceSettings
+        })).unwrap();
+        
+        // Small delay between generations
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      } catch (error) {
+        console.error(`Audio generation failed for ${file.name}:`, error);
+      }
+    }
+
+    return filesToProcess.length;
+  }, [approvedFiles, files, dispatch, voiceSettings]);
+
   const getProcessingStats = useCallback(() => {
     const total = files.length;
     const completed = files.filter(f => f.status === FILE_STATUS.COMPLETED).length;
@@ -173,6 +287,13 @@ export const useFileProcessor = () => {
       f.status === FILE_STATUS.GENERATING_SPEECH
     ).length;
     const pending = files.filter(f => f.status === FILE_STATUS.PENDING).length;
+    const reviewPending = files.filter(f => f.status === FILE_STATUS.REVIEW_PENDING).length;
+    const approved = files.filter(f => f.status === FILE_STATUS.APPROVED).length;
+
+    // Consider processing active if there's a current file OR files in processing states OR queue has items
+    const isActivelyProcessing = currentlyProcessing !== null || 
+                                processing > 0 || 
+                                (processingQueue.length > 0 && (pending > 0 || approved > 0));
 
     return {
       total,
@@ -180,25 +301,32 @@ export const useFileProcessor = () => {
       failed,
       processing,
       pending,
+      reviewPending,
+      approved,
       completionRate: total > 0 ? (completed / total) * 100 : 0,
-      isProcessing: currentlyProcessing !== null
+      isProcessing: isActivelyProcessing
     };
-  }, [files, currentlyProcessing]);
+  }, [files, currentlyProcessing, processingQueue.length]);
 
+  const stats = getProcessingStats();
+  
   return {
     // Actions
     startBatchProcessing,
     pauseProcessing,
     resumeProcessing,
     retryFailedFiles,
+    reprocessFile,
+    startBatchAudioGeneration,
     processNextInQueue,
     
     // State
-    isProcessing: currentlyProcessing !== null,
+    isProcessing: stats.isProcessing,
     currentFile: currentlyProcessing ? files.find(f => f.id === currentlyProcessing) : null,
     queueLength: processingQueue.length,
+    reviewQueueLength: reviewQueue.length,
     
     // Stats
-    stats: getProcessingStats()
+    stats
   };
 };

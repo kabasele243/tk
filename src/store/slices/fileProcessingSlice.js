@@ -8,6 +8,8 @@ export const FILE_STATUS = {
   TRANSCRIBED: 'transcribed',
   AI_PROCESSING: 'ai_processing',
   AI_PROCESSED: 'ai_processed',
+  REVIEW_PENDING: 'review_pending',
+  APPROVED: 'approved',
   GENERATING_SPEECH: 'generating_speech',
   COMPLETED: 'completed',
   FAILED: 'failed'
@@ -16,12 +18,30 @@ export const FILE_STATUS = {
 // Async thunks for processing
 export const transcribeFile = createAsyncThunk(
   'fileProcessing/transcribeFile',
-  async ({ fileId, file }, { rejectWithValue }) => {
+  async ({ fileId, file }, { rejectWithValue, getState }) => {
     try {
+      // Check if file is already being transcribed or transcribed
+      const state = getState();
+      const currentFile = state.fileProcessing.files.find(f => f.id === fileId);
+      
+      if (!currentFile) {
+        return rejectWithValue({ fileId, error: 'File not found' });
+      }
+      
+      // If file is already transcribed, just return existing result
+      if (currentFile.status === FILE_STATUS.TRANSCRIBED && currentFile.transcription) {
+        return { fileId, result: currentFile.transcription };
+      }
+      
+      if (currentFile.status !== FILE_STATUS.PENDING && 
+          currentFile.status !== FILE_STATUS.TRANSCRIBING) {
+        return rejectWithValue({ fileId, error: 'File not in correct state for transcription' });
+      }
+      
       const formData = new FormData();
       formData.append('file', file);
       formData.append('temperature', '0.0');
-
+      
       const response = await fetch('http://0.0.0.0:8080/transcribe', {
         method: 'POST',
         body: formData,
@@ -41,8 +61,26 @@ export const transcribeFile = createAsyncThunk(
 
 export const processWithAI = createAsyncThunk(
   'fileProcessing/processWithAI',
-  async ({ fileId, text, prompt, apiKey }, { rejectWithValue }) => {
+  async ({ fileId, text, prompt, apiKey }, { rejectWithValue, getState }) => {
     try {
+      // Check if file is in the correct state for AI processing
+      const state = getState();
+      const currentFile = state.fileProcessing.files.find(f => f.id === fileId);
+      
+      // If file is already AI processed, just return existing result
+      if ((currentFile.status === FILE_STATUS.AI_PROCESSED || 
+           currentFile.status === FILE_STATUS.REVIEW_PENDING ||
+           currentFile.status === FILE_STATUS.APPROVED) && currentFile.aiResult) {
+        return { fileId, result: currentFile.aiResult };
+      }
+      
+      if (!currentFile || (
+        currentFile.status !== FILE_STATUS.TRANSCRIBED && 
+        currentFile.status !== FILE_STATUS.AI_PROCESSING
+      )) {
+        return rejectWithValue({ fileId, error: 'File not in correct state for AI processing' });
+      }
+      
       const openai = new OpenAI({
         apiKey: apiKey,
         dangerouslyAllowBrowser: true
@@ -123,7 +161,10 @@ const fileProcessingSlice = createSlice({
     completedJobs: [],
     globalSettings: {
       aiPrompt: 'Please rewrite this text to make it more professional and well-structured while maintaining the original meaning.',
+      customPrompt: '',
       selectedPromptType: 'professional',
+      batchReviewMode: true,
+      autoApprove: false,
       voiceSettings: {
         voice: 'af_heart',
         speed: 1.0,
@@ -131,6 +172,8 @@ const fileProcessingSlice = createSlice({
         model: 'kokoro'
       }
     },
+    reviewQueue: [],
+    approvedFiles: [],
     statistics: {
       totalFiles: 0,
       completedFiles: 0,
@@ -150,6 +193,8 @@ const fileProcessingSlice = createSlice({
         progress: 0,
         transcription: null,
         aiResult: null,
+        reviewStatus: 'pending',
+        approved: false,
         finalAudio: null,
         timestamps: {
           added: new Date().toISOString(),
@@ -274,6 +319,70 @@ const fileProcessingSlice = createSlice({
         });
         state.statistics.failedFiles++;
       }
+    },
+    
+    approveFile: (state, action) => {
+      const fileId = action.payload;
+      const file = state.files.find(f => f.id === fileId);
+      if (file) {
+        file.approved = true;
+        file.reviewStatus = 'approved';
+        file.status = FILE_STATUS.APPROVED;
+        state.approvedFiles.push(fileId);
+      }
+    },
+    
+    rejectFile: (state, action) => {
+      const fileId = action.payload;
+      const file = state.files.find(f => f.id === fileId);
+      if (file) {
+        file.approved = false;
+        file.reviewStatus = 'rejected';
+        file.status = FILE_STATUS.AI_PROCESSED;
+      }
+    },
+    
+    updateEditableAIResult: (state, action) => {
+      const { fileId, text } = action.payload;
+      const file = state.files.find(f => f.id === fileId);
+      if (file) {
+        file.editableAIResult = text;
+        file.reviewStatus = 'edited';
+      }
+    },
+    
+    addToReviewQueue: (state, action) => {
+      const fileIds = Array.isArray(action.payload) ? action.payload : [action.payload];
+      state.reviewQueue.push(...fileIds.filter(id => !state.reviewQueue.includes(id)));
+    },
+    
+    removeFromReviewQueue: (state, action) => {
+      const fileId = action.payload;
+      state.reviewQueue = state.reviewQueue.filter(id => id !== fileId);
+    },
+    
+    approveAllReviewed: (state) => {
+      state.files.forEach(file => {
+        if (file.status === FILE_STATUS.AI_PROCESSED || file.status === FILE_STATUS.REVIEW_PENDING) {
+          file.approved = true;
+          file.reviewStatus = 'approved';
+          file.status = FILE_STATUS.APPROVED;
+          if (!state.approvedFiles.includes(file.id)) {
+            state.approvedFiles.push(file.id);
+          }
+        }
+      });
+    },
+    
+    setCustomPrompt: (state, action) => {
+      state.globalSettings.customPrompt = action.payload;
+      if (action.payload) {
+        state.globalSettings.selectedPromptType = 'custom';
+      }
+    },
+    
+    setBatchReviewMode: (state, action) => {
+      state.globalSettings.batchReviewMode = action.payload;
     }
   },
   
@@ -326,11 +435,14 @@ const fileProcessingSlice = createSlice({
         const { fileId, result } = action.payload;
         const file = state.files.find(f => f.id === fileId);
         if (file) {
-          file.status = FILE_STATUS.AI_PROCESSED;
+          file.status = state.globalSettings.batchReviewMode ? FILE_STATUS.REVIEW_PENDING : FILE_STATUS.AI_PROCESSED;
           file.aiResult = result;
           file.editableAIResult = result.processed_text;
           file.timestamps.aiProcessingEnd = new Date().toISOString();
           file.progress = 66;
+          if (state.globalSettings.batchReviewMode && !state.reviewQueue.includes(fileId)) {
+            state.reviewQueue.push(fileId);
+          }
         }
       })
       .addCase(processWithAI.rejected, (state, action) => {
@@ -397,7 +509,15 @@ export const {
   updateFileFinalAudio,
   addCompletedJob,
   markFileCompleted,
-  markFileFailed
+  markFileFailed,
+  approveFile,
+  rejectFile,
+  updateEditableAIResult,
+  addToReviewQueue,
+  removeFromReviewQueue,
+  approveAllReviewed,
+  setCustomPrompt,
+  setBatchReviewMode
 } = fileProcessingSlice.actions;
 
 export default fileProcessingSlice.reducer;
